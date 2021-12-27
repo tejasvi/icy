@@ -3,19 +3,22 @@ from typing import Optional
 from model import raw_str_start_pat, single_line_str_end_pat, char_end_pat, single_line_new_comment_pat, Match, CurLineData, State
 
 
-def strip_string_comment(cur_line_data: CurLineData, cur_line_errors: list[str], cur_state: State)->None:
-    while cur_line_data.line:
+def strip_string_comment(cur_line_data: CurLineData, cur_line_errors: list[str], cur_state: State)->bool:
+    comment_end_backslash = False
+    while True:
         earliest_match, errors = earliest_non_code_match(cur_line_data.line)
         cur_line_errors.extend(errors)
 
         cur_line_data.line, comment = split_comment_if_early(cur_line_data.line, earliest_match)
         cur_line_data.right_end.append(comment)
+        if comment.endswith('\\'):
+            comment_end_backslash = True
 
         if not comment:
             cur_line_data.line, left_end, cur_state.multiline_end_marker, processed = split_match_end(cur_line_data.line, earliest_match)
             cur_line_data.left_end.append(left_end)
             if processed:
-                break
+                return comment_end_backslash
 
 
 def earlier_single_line_char(cur_line: str, earliest_match: Match) -> tuple[Match, str]:

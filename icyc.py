@@ -3,7 +3,7 @@ from difflib import ndiff
 from itertools import islice
 from pathlib import Path
 
-from model import full_line_comment_pat, lonely_closing_brace_pat, lonely_template_pat, skip_join_next_pat, preprocessor_pat, IndentData, State, IndentTracker, ParenLineNums, NextLineData, Result, CurLineData
+from model import full_line_comment_pat, lonely_closing_brace_pat, lonely_template_pat, skip_join_next_pat, preprocessor_pat, IndentData, State, IndentTracker, ParenLineNums, NextLineData, Result, CurLineData, Scope, ScopeKind, enum_pat, preprocessor_if_else_pat, lonely_opening_brace_pat, preprocessor_end_pat, if_pat, do_pat, try_pat, value_opening_brace_pat
 from strip import strip_string_comment
 
 CONTINUATION_CHARS = {';', ':', '{', '(', '[', '::', '=', '/', '<', ','}
@@ -12,9 +12,26 @@ preserve_line_num: bool = True
 indent_with_tabs = False
 
 
+def scope_kind(lines: list[str])->ScopeKind:
+    effective_line = ''.join(lines)
+    pat_types = (
+        (preprocessor_if_else_pat, ScopeKind.IF_ELSE_DIRECTIVE),
+        (value_opening_brace_pat, ScopeKind.VALUE),
+        (enum_pat, ScopeKind.ENUM),
+        (if_pat, ScopeKind.IF),
+        (do_pat, ScopeKind.DO),
+        (try_pat, ScopeKind.TRY),
+        (lonely_opening_brace_pat, ScopeKind.LONELY)
+     )
+    for pat, pat_type in pat_types:
+        if pat.search(effective_line):
+            return pat_type
+    return ScopeKind.OTHER
+
+
 def main(in_lines: list[str]) -> Result:
     paren_line_nums = ParenLineNums([], [])
-    indent_stack: list[IndentData] = []
+    scope_stack: list[Scope] = []
 
     effective_state = last_state = State(None, [], False, IndentData(0, ''), False, 0)
 
@@ -24,15 +41,18 @@ def main(in_lines: list[str]) -> Result:
         _cur_line.rstrip()
         if specifier_or_comment_or_empty(_cur_line):
             result.output.append(_cur_line)
-            continue
+            pass#continue
+        cur_line_end_slash = _cur_line.endswith('\\')
+        if cur_line_end_slash:
+            _cur_line = _cur_line[:-1]
+        cur_line_data = CurLineData([], _cur_line, [], _cur_line_num)
 
         cur_line_errors = result.errors[_cur_line_num] = []
 
-        cur_line_data = CurLineData([], _cur_line, [], _cur_line_num)
 
         cur_preprocessor = False
         if effective_state.multiline_end_marker is None:
-            cur_preprocessor = last_state.preprocessor if last_state.join_next else bool(preprocessor_pat.match(cur_line_data.line))
+            cur_preprocessor = last_state.preprocessor if last_state.join_next else bool(preprocessor_pat.search(cur_line_data.line))
         else:
             if not strip_till_mutiline_end_marker(cur_line_data, effective_state):
                 result.output.append(cur_line_data.line)
@@ -40,19 +60,25 @@ def main(in_lines: list[str]) -> Result:
 
         _cur_line_effective_indent = last_state.indent_data if last_state.join_next else line_indentation(cur_line_data.line)
 
-        if not cur_preprocessor:
-            strip_string_comment(cur_line_data, cur_line_errors, effective_state)
-
         _next_line = next_code_line(cur_line_data.line_num, in_lines)
         _next_line_indent = line_indentation(_next_line).indent
 
-        cur_join_next = (not (cur_preprocessor or (cur_line_data.line and cur_line_data.line[-1] in ('{', ';'))) and _next_line_indent > _cur_line_effective_indent.indent) or cur_line_data.line.endswith('\\') or effective_state.multiline_end_marker is not None
-        next_line_data = NextLineData(_next_line, _cur_line_effective_indent if cur_join_next else _next_line_indent)
+        if not cur_preprocessor:
+            comment_end_backslash = strip_string_comment(cur_line_data, cur_line_errors, effective_state)
 
+        cur_join_next = cur_line_end_slash or effective_state.multiline_end_marker is not None or (
+                not cur_preprocessor
+                and (value_opening_brace_pat.search(cur_line_data.line) or not (cur_line_data.line and cur_line_data.line[-1] in ('{', ';')))
+                and _next_line_indent > _cur_line_effective_indent.indent
+        )
+
+        process_cur_line = not (cur_join_next or cur_preprocessor)
+
+        next_line_data = NextLineData(_next_line, _cur_line_effective_indent if cur_join_next else _next_line_indent)
         effective_state = get_cur_state(_cur_line_effective_indent, cur_join_next, cur_line_data, cur_preprocessor, last_state)
 
-        if not (cur_join_next or cur_preprocessor):
-            if paren_line_nums.close and lonely_closing_brace_pat.match(cur_line_data.line):
+        if process_cur_line:
+            if paren_line_nums.close and lonely_closing_brace_pat.search(cur_line_data.line):
                 if paren_line_nums.open and line_indentation(cur_line_data.line).indent == paren_line_nums.open[-1].indent:
                     paren_line_nums.open.pop()
                 else:
@@ -60,15 +86,16 @@ def main(in_lines: list[str]) -> Result:
                 paren_line_nums.close.pop()
             elif cur_line_data.line.endswith('{'):
                 paren_line_nums.open.append(IndentTracker(effective_state.indent_data.indent, cur_line_data.line_num))
-                if next_line_data.effective_indent > effective_state.indent_data.indent or lonely_closing_brace_pat.match(next_line_data.line):
-                    indent_stack.append(effective_state.indent_data)
-            elif next_line_data.effective_indent <= effective_state.indent_data.indent and add_semicolon(cur_line_data.line, effective_state):
+                if next_line_data.effective_indent > effective_state.indent_data.indent or lonely_closing_brace_pat.search(next_line_data.line):
+                    scope_stack.append(Scope(effective_state.indent_data, scope_kind(effective_state.lines)))
+
+            if next_line_data.effective_indent <= effective_state.indent_data.indent and add_semicolon(cur_line_data.line, effective_state.lines) and (not scope_stack or scope_stack[-1].kind not in (ScopeKind.ENUM, ScopeKind.VALUE)):
                 cur_line_data.right_end.append(';')
 
         result.output.append(''.join(cur_line_data.left_end) + cur_line_data.line + ''.join(reversed(cur_line_data.right_end)))
 
-        if not (cur_join_next or cur_preprocessor):
-            add_closing_brackets(cur_line_data.line_num, effective_state, indent_stack, next_line_data, paren_line_nums, result)
+        if process_cur_line:
+            add_closing_brackets(cur_line_data.line_num, effective_state, scope_stack, next_line_data, paren_line_nums, result)
 
         last_state = effective_state
 
@@ -99,50 +126,56 @@ def get_cur_state(cur_line_effective_indent: IndentData, cur_join_next: bool, cu
     return cur_state
 
 
-def add_closing_brackets(cur_line_num: int, cur_state: State, indent_stack: list[IndentData], next_line_data: NextLineData, paren_line_nums: ParenLineNums, result: Result)->None:
+def add_closing_brackets(cur_line_num: int, cur_state: State, scope_stack: list[Scope], next_line_data: NextLineData, paren_line_nums: ParenLineNums, result: Result)->None:
     cur_upper_bound = cur_state.indent_data.indent
-    while indent_stack:
-        if next_line_data.effective_indent <= indent_stack[-1].indent:
-            parent_indent = indent_stack.pop()
+    while scope_stack:
+        if next_line_data.effective_indent <= scope_stack[-1].indent_data.indent:
+            parent_scope = scope_stack.pop()
             append = True
-            if lonely_closing_brace_pat.match(next_line_data.line):
-                if next_line_data.effective_indent == parent_indent.indent:
+            if lonely_closing_brace_pat.search(next_line_data.line):
+                if next_line_data.effective_indent == parent_scope.indent_data.indent:
                     append = False
                 else:
                     paren_line_nums.close.append(cur_line_num + 1)
             if append:
+                bracket_string = '}' if parent_scope.kind in {ScopeKind.TRY, ScopeKind.IF, ScopeKind.DO, ScopeKind.LONELY, ScopeKind.VALUE} else '};'
                 if preserve_line_num:
-                    result.output[-1] += '};'
+                    result.output[-1] += bracket_string
                 else:
-                    result.output.append(parent_indent.indent_whitespace + '};')
+                    result.output.append(parent_scope.indent_data.whitespace + bracket_string)
             paren_line_nums.open.pop()
-            cur_upper_bound = parent_indent.indent
+            cur_upper_bound = parent_scope.indent_data.indent
         else:
-            if indent_stack[-1].indent < next_line_data.effective_indent < cur_upper_bound:
-                result.errors[cur_line_num].append(f"Expected indentation to be either {indent_stack[-1].indent} or {cur_upper_bound} spaces equivalent.")
+            if scope_stack[-1].indent_data.indent < next_line_data.effective_indent < cur_upper_bound:
+                result.errors[cur_line_num].append(f"Expected indentation to be either {scope_stack[-1].indent_data.indent} or {cur_upper_bound} spaces equivalent.")
             break
 
 
 def lonely_closing_brace(indent: int, line: str) -> bool:
-    return lonely_closing_brace_pat.match(line) and line_indentation(line) == indent
+    return lonely_closing_brace_pat.search(line) and line_indentation(line) == indent
 
 
-def add_semicolon(cur_line: str, cur_state: State) -> bool:
+def add_semicolon(cur_line: str, lines: list[str]) -> bool:
     _add = False
     if cur_line and cur_line[-1] not in CONTINUATION_CHARS:
-        _add = True
-        if lonely_template_pat.match(''.join(cur_state.lines)):
-            open_idx = cur_line.find('<')
-            assert open_idx != -1
-            unbalanced = 1
-            for c in islice(cur_line, open_idx + 1):
-                if c == '<':
-                    unbalanced += 1
-                elif c == '>':
-                    unbalanced -= 1
-            if unbalanced != 0:
-                _add = False
+        _add = lonely_template_declaration(lines)
     return _add
+
+
+def lonely_template_declaration(lines: list[str])->bool:
+    effective_line = ''.join(lines)
+    if lonely_template_pat.search(effective_line):
+        open_idx = effective_line.find('<')
+        assert open_idx != -1
+        unbalanced = 1
+        for c in islice(effective_line, open_idx + 1):
+            if c == '<':
+                unbalanced += 1
+            elif c == '>':
+                unbalanced -= 1
+        if unbalanced != 0:
+            return False
+    return True
 
 
 def split_if_end_marker(cur_line: str, multiline_end_marker: str) -> tuple[str, str, bool]:
@@ -169,7 +202,7 @@ def next_code_line(cur_line_num: int, in_lines: list[str]) -> str:
 
 
 def empty_or_comment(cur_line: str) -> bool:
-    return bool(not cur_line.rstrip() or full_line_comment_pat.match(cur_line))
+    return bool(not cur_line.rstrip() or full_line_comment_pat.search(cur_line))
 
 
 def specifier_or_comment_or_empty(cur_line: str) -> bool:
